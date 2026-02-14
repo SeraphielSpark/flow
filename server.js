@@ -211,7 +211,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
     }
 
     // 5. Redirect back to Frontend
-    res.redirect('https://seraphielspark.github.io/flow/index.html?status=connected');
+    res.redirect('https://seraphielspark.github.io/flowon/flow.html?status=connected');
 
   } catch (err) {
     console.error("OAuth token exchange error:", err.response?.data || err.message);
@@ -219,3 +219,4 @@ app.get('/api/google/oauth/callback', async (req, res) => {
   }
 });
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
