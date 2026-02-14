@@ -1,19 +1,41 @@
 const express = require('express');
 const fetch = require('node-fetch');
-const app = express();
+const axios = require('axios');
 const cors = require('cors');
+const session = require('express-session');
+require('dotenv').config();
 
+const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Correctly apply CORS options
+// --- CORS setup ---
 const corsOptions = {
-  origin: '*', // In production, replace '*' with your specific frontend domain
+  origin: '*', // replace '*' with frontend domain in production
   optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
 
+// --- Body parsers ---
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// --- Session setup ---
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'super-secret',
+  resave: false,
+  saveUninitialized: true
+}));
+
+// --- Helper functions (replace with real DB logic) ---
+const tokensDB = {}; // demo in-memory storage
+
+async function saveTokensToDB({ userId, access_token, refresh_token, expires_at }) {
+  tokensDB[userId] = { access_token, refresh_token, expires_at };
+}
+
+async function getTokensFromDB(userId) {
+  return tokensDB[userId];
+}
 
 // --- 1. Proxy GET User Data ---
 app.get('/api/userdata/:flowid', async (req, res) => {
@@ -28,25 +50,21 @@ app.get('/api/userdata/:flowid', async (req, res) => {
   }
 });
 
-// --- 2. Proxy POST Update Customers (Now includes templates) ---
+// --- 2. Proxy POST Update Customers ---
 app.post('/api/updatecustomers', async (req, res) => {
-  // Destructure all possible fields sent by frontend
   const { userId, customers, templates } = req.body;
-  
   try {
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/updatecustomers`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
         userid: userId,
-        customers: JSON.stringify(customers), // Send as JSON string if n8n expects it
-        templates: JSON.stringify(templates)  // Pass templates along
+        customers: JSON.stringify(customers),
+        templates: JSON.stringify(templates)
       })
     });
-    
     const data = await response.json();
     res.json({ success: true, message: 'Data updated successfully', data });
-    
   } catch (err) {
     console.error('Update Customers Error:', err);
     res.status(500).json({ error: 'Failed to update customers' });
@@ -70,7 +88,7 @@ app.post('/api/createtable', async (req, res) => {
   }
 });
 
-// --- 4. Proxy POST Update Templates (New) ---
+// --- 4. Proxy POST Update Templates ---
 app.post('/api/updatetemplates', async (req, res) => {
   const { userid, templates } = req.body;
   try {
@@ -79,8 +97,6 @@ app.post('/api/updatetemplates', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userid, templates })
     });
-    
-    // Check if response is JSON, otherwise send status
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
@@ -94,16 +110,27 @@ app.post('/api/updatetemplates', async (req, res) => {
   }
 });
 
-// --- 5. Proxy POST Send Automated Messages (New) ---
+// --- 5. Proxy POST Send Automated Messages ---
 app.post('/api/send-automated-messages', async (req, res) => {
   try {
-    // Forward the entire body (campaign data) to n8n
+    const { userId, emailData } = req.body;
+
+    // Retrieve Gmail access_token from DB
+    const userTokens = await getTokensFromDB(userId);
+    if (!userTokens) return res.status(400).json({ error: 'User Gmail not connected' });
+
+    // Include token in payload to n8n
+    const payload = {
+      ...emailData,
+      access_token: userTokens.access_token
+    };
+
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/send-automated-messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body)
+      body: JSON.stringify(payload)
     });
-    
+
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
@@ -117,15 +144,78 @@ app.post('/api/send-automated-messages', async (req, res) => {
   }
 });
 
+// --- 6. Simple GET endpoint ---
 app.get('/get', (req, res) => {
   res.json('Welcome To HTTP REQUEST CLASS');
 });
+
+// --- 7. Receive email (example) ---
 app.post('/api/receive-email', (req, res) => {
   const emailData = req.body;
   console.log('Email received:', emailData);
-  // Save to DB or display in real-time
   res.status(200).send({ success: true });
 });
 
+// --- 8. Google OAuth connect ---
+app.get('/api/google/connect', (req, res) => {
+  const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly');
 
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent`;
+
+  res.redirect(authUrl);
+});
+
+// --- 9. Google OAuth callback (UPDATED) ---
+app.get('/api/google/oauth/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("No code provided");
+
+  try {
+    // 1. Exchange code for tokens from Google
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
+      code: code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
+      grant_type: 'authorization_code'
+    });
+
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+
+    // 2. Identify the user (In production, use real session ID)
+    const userId = req.session.userId || 'demo-user'; // fallback for demo
+    
+    // 3. Save to Local DB (Optional, if you want to keep a copy)
+    await saveTokensToDB({
+      userId,
+      access_token,
+      refresh_token,
+      expires_at: Date.now() + expires_in * 1000
+    });
+
+    // 4. CRITICAL: Send Keys to n8n Webhook
+    // This allows n8n to store the credentials for automation
+    try {
+        await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
+            userId: userId,
+            google_access_token: access_token,
+            google_refresh_token: refresh_token,
+            token_expiry: Date.now() + expires_in * 1000
+        });
+        console.log("Keys successfully sent to n8n");
+    } catch (n8nError) {
+        console.error("Failed to send keys to n8n:", n8nError.message);
+        // We don't stop the flow here, just log the error
+    }
+
+    // 5. Redirect back to Frontend
+    res.redirect('https://seraphielspark.github.io/flow/index.html?status=connected');
+
+  } catch (err) {
+    console.error("OAuth token exchange error:", err.response?.data || err.message);
+    res.status(500).send("Failed to connect Gmail");
+  }
+});
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
