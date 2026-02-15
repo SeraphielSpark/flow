@@ -155,14 +155,24 @@ app.post('/api/receive-email', (req, res) => {
   console.log('Email received:', emailData);
   res.status(200).send({ success: true });
 });
-
-// --- 8. Google OAuth connect ---
+// --- 8. Google OAuth connect (UPDATED) ---
 app.get('/api/google/connect', (req, res) => {
+  // 1. Get userId from the frontend request query
+  const userId = req.query.userId; 
+
+  if (!userId) {
+    return res.status(400).send("Missing userId. Cannot link account.");
+  }
+
   const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
   const clientId = process.env.GOOGLE_CLIENT_ID;
+  
+  // Scopes: Gmail send, read, and basic profile
   const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly');
 
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent`;
+  // 2. Pass userId into the 'state' parameter. 
+  // Google returns this value unchanged in the callback.
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${userId}`;
 
   res.redirect(authUrl);
 });
@@ -170,24 +180,27 @@ app.get('/api/google/connect', (req, res) => {
 // --- 9. Google OAuth callback (UPDATED) ---
 app.get('/api/google/oauth/callback', async (req, res) => {
   const code = req.query.code;
+  // 1. Retrieve the userId from the 'state' query param returned by Google
+  const userId = req.query.state; 
+
   if (!code) return res.status(400).send("No code provided");
+  if (!userId) return res.status(400).send("No userId returned in state parameter");
 
   try {
-    // 1. Exchange code for tokens from Google
-    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
-      code: code,
-      client_id: process.env.GOOGLE_CLIENT_ID,
-      client_secret: process.env.GOOGLE_CLIENT_SECRET,
-      redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
-      grant_type: 'authorization_code'
+    // 2. Exchange code for tokens from Google
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', null, {
+      params: {
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
+        grant_type: 'authorization_code'
+      }
     });
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
-
-    // 2. Identify the user (In production, use real session ID)
-    const userId = req.session.userId || 'demo-user'; // fallback for demo
     
-    // 3. Save to Local DB (Optional, if you want to keep a copy)
+    // 3. Save to Local DB (Optional cache)
     await saveTokensToDB({
       userId,
       access_token,
@@ -195,19 +208,24 @@ app.get('/api/google/oauth/callback', async (req, res) => {
       expires_at: Date.now() + expires_in * 1000
     });
 
-    // 4. CRITICAL: Send Keys to n8n Webhook
-    // This allows n8n to store the credentials for automation
+    // 4. CRITICAL: Send Keys AND userId to n8n Webhook
     try {
+        console.log(`Sending credentials to n8n for User: ${userId}`);
+
         await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
-            userId: userId,
+            // STRICTLY sending the userId we recovered
+            userId: userId, 
             google_access_token: access_token,
-            google_refresh_token: refresh_token,
-            token_expiry: Date.now() + expires_in * 1000
+            // Refresh token is only returned on the first consent. 
+            // If undefined, the user has already authorized the app previously.
+            google_refresh_token: refresh_token || "ALREADY_AUTHORIZED", 
+            token_expiry: Date.now() + expires_in * 1000,
+            timestamp: new Date().toISOString()
         });
+        
         console.log("Keys successfully sent to n8n");
     } catch (n8nError) {
         console.error("Failed to send keys to n8n:", n8nError.message);
-        // We don't stop the flow here, just log the error
     }
 
     // 5. Redirect back to Frontend
@@ -218,5 +236,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
     res.status(500).send("Failed to connect Gmail");
   }
 });
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
