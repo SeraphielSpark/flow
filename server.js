@@ -91,102 +91,14 @@ async function getTokensFromDB(userId) {
 }
 
 // ==========================================
-//  AUTHENTICATION ENDPOINTS (SIGNUP & LOGIN)
+//  API ENDPOINTS
 // ==========================================
 
-/**
- * Signup Endpoint - Proxy to n8n webhook
- * Matches your n8n workflow structure exactly
- */
-app.post('/webhook/signup', async (req, res) => {
-  try {
-    const { username, email, password } = req.body;
-    
-    // Validate required fields
-    if (!username || !email || !password) {
-      return res.status(400).json({ 
-        message: 'Username, email, and password are required' 
-      });
-    }
-
-    console.log(`Signup attempt for: ${email}`);
-
-    // Forward to n8n webhook
-    const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        username, 
-        email, 
-        password 
-      })
-    });
-
-    const data = await response.json();
-    
-    // Return the response from n8n which includes userid
-    res.status(response.status).json(data);
-    
-  } catch (err) {
-    console.error('Signup Error:', err.message);
-    res.status(500).json({ 
-      message: 'Signup failed. Please try again.' 
-    });
-  }
-});
-
-/**
- * Login Endpoint - Proxy to n8n webhook
- * Matches your n8n workflow structure exactly
- */
-app.post('/webhook/login', async (req, res) => {
-  try {
-    const { userid } = req.body;
-    
-    // Validate required field
-    if (!userid) {
-      return res.status(400).json({ 
-        message: 'User ID is required' 
-      });
-    }
-
-    console.log(`Login attempt for User ID: ${userid}`);
-
-    // Forward to n8n webhook
-    const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userid })
-    });
-
-    const data = await response.json();
-    
-    // Return the response from n8n
-    res.status(response.status).json(data);
-    
-  } catch (err) {
-    console.error('Login Error:', err.message);
-    res.status(500).json({ 
-      message: 'Login failed. Please check your User ID.' 
-    });
-  }
-});
-
-/**
- * Get User Data by User ID
- * This matches your existing /api/userdata/:flowid endpoint but adds better error handling
- */
+// --- 1. Proxy GET User Data ---
 app.get('/api/userdata/:flowid', async (req, res) => {
   const { flowid } = req.params;
   try {
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/e6bf03cc-c9e6-4727-91c5-375b420ac2ce/${flowid}/`);
-    
-    if (!response.ok) {
-      return res.status(response.status).json({ 
-        error: 'User not found or data unavailable' 
-      });
-    }
-    
     const data = await response.json();
     res.json(data);
   } catch (err) {
@@ -194,10 +106,6 @@ app.get('/api/userdata/:flowid', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch data from n8n' });
   }
 });
-
-// ==========================================
-//  EXISTING API ENDPOINTS (PRESERVED EXACTLY)
-// ==========================================
 
 // --- 2. Proxy POST Update Customers ---
 app.post('/api/updatecustomers', async (req, res) => {
@@ -403,6 +311,82 @@ app.get('/api/google/oauth/callback', async (req, res) => {
   } catch (err) {
     console.error("OAuth token exchange error:", err.response?.data || err.message);
     res.status(500).send("Failed to connect Gmail");
+  }
+});
+
+// ==========================================
+//  DEBUG & STATUS ENDPOINTS (ADDED WITHOUT DISRUPTING EXISTING CODE)
+// ==========================================
+
+// --- 11. DEBUG: Check token status for a user ---
+app.get('/api/debug/tokens/:userId', async (req, res) => {
+  const { userId } = req.params;
+  const tokens = await getTokensFromDB(userId);
+  
+  if (tokens) {
+    res.json({ 
+      exists: true, 
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      expires_at: tokens.expires_at,
+      expires_in_days: tokens.expires_at ? Math.round((tokens.expires_at - Date.now()) / (1000 * 60 * 60 * 24)) : null,
+      user_id: userId
+    });
+  } else {
+    res.json({ 
+      exists: false, 
+      user_id: userId,
+      message: 'No tokens found for this user'
+    });
+  }
+});
+
+// --- 12. Check Google connection status ---
+app.get('/api/google/status', async (req, res) => {
+  const userId = req.query.userId;
+  
+  if (!userId) {
+    return res.status(400).json({ 
+      connected: false, 
+      error: 'No userId provided' 
+    });
+  }
+  
+  const tokens = await getTokensFromDB(userId);
+  const connected = !!(tokens && tokens.access_token);
+  
+  res.json({ 
+    connected,
+    userId,
+    hasTokens: !!tokens,
+    tokenExpiry: tokens?.expires_at,
+    isExpired: tokens?.expires_at ? tokens.expires_at < Date.now() : null
+  });
+});
+
+// --- 13. Force refresh tokens from n8n (useful for testing) ---
+app.post('/api/google/refresh-tokens/:userId', async (req, res) => {
+  const { userId } = req.params;
+  
+  // Clear memory cache for this user
+  if (tokensDB[userId]) {
+    delete tokensDB[userId];
+  }
+  
+  // Force fetch from n8n
+  const tokens = await getTokensFromDB(userId);
+  
+  if (tokens) {
+    res.json({ 
+      success: true, 
+      message: 'Tokens refreshed from n8n',
+      hasTokens: true
+    });
+  } else {
+    res.json({ 
+      success: false, 
+      message: 'No tokens found in n8n for this user'
+    });
   }
 });
 
