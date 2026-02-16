@@ -91,14 +91,102 @@ async function getTokensFromDB(userId) {
 }
 
 // ==========================================
-//  API ENDPOINTS
+//  AUTHENTICATION ENDPOINTS (SIGNUP & LOGIN)
 // ==========================================
 
-// --- 1. Proxy GET User Data ---
+/**
+ * Signup Endpoint - Proxy to n8n webhook
+ * Matches your n8n workflow structure exactly
+ */
+app.post('/webhook/signup', async (req, res) => {
+  try {
+    const { username, email, password } = req.body;
+    
+    // Validate required fields
+    if (!username || !email || !password) {
+      return res.status(400).json({ 
+        message: 'Username, email, and password are required' 
+      });
+    }
+
+    console.log(`Signup attempt for: ${email}`);
+
+    // Forward to n8n webhook
+    const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        username, 
+        email, 
+        password 
+      })
+    });
+
+    const data = await response.json();
+    
+    // Return the response from n8n which includes userid
+    res.status(response.status).json(data);
+    
+  } catch (err) {
+    console.error('Signup Error:', err.message);
+    res.status(500).json({ 
+      message: 'Signup failed. Please try again.' 
+    });
+  }
+});
+
+/**
+ * Login Endpoint - Proxy to n8n webhook
+ * Matches your n8n workflow structure exactly
+ */
+app.post('/webhook/login', async (req, res) => {
+  try {
+    const { userid } = req.body;
+    
+    // Validate required field
+    if (!userid) {
+      return res.status(400).json({ 
+        message: 'User ID is required' 
+      });
+    }
+
+    console.log(`Login attempt for User ID: ${userid}`);
+
+    // Forward to n8n webhook
+    const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userid })
+    });
+
+    const data = await response.json();
+    
+    // Return the response from n8n
+    res.status(response.status).json(data);
+    
+  } catch (err) {
+    console.error('Login Error:', err.message);
+    res.status(500).json({ 
+      message: 'Login failed. Please check your User ID.' 
+    });
+  }
+});
+
+/**
+ * Get User Data by User ID
+ * This matches your existing /api/userdata/:flowid endpoint but adds better error handling
+ */
 app.get('/api/userdata/:flowid', async (req, res) => {
   const { flowid } = req.params;
   try {
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/e6bf03cc-c9e6-4727-91c5-375b420ac2ce/${flowid}/`);
+    
+    if (!response.ok) {
+      return res.status(response.status).json({ 
+        error: 'User not found or data unavailable' 
+      });
+    }
+    
     const data = await response.json();
     res.json(data);
   } catch (err) {
@@ -106,6 +194,10 @@ app.get('/api/userdata/:flowid', async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch data from n8n' });
   }
 });
+
+// ==========================================
+//  EXISTING API ENDPOINTS (PRESERVED EXACTLY)
+// ==========================================
 
 // --- 2. Proxy POST Update Customers ---
 app.post('/api/updatecustomers', async (req, res) => {
