@@ -1,5 +1,5 @@
 const express = require('express');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch'); // Ensure you are using node-fetch v2 for CommonJS
 const axios = require('axios');
 const cors = require('cors');
 const session = require('express-session');
@@ -10,32 +10,89 @@ const PORT = process.env.PORT || 3000;
 
 // --- CORS setup ---
 const corsOptions = {
-  origin: '*', // replace '*' with frontend domain in production
+  origin: '*', // Allow all origins (Replace with your specific domain in production for security)
   optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
 
 // --- Body parsers ---
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '50mb' })); // Increased limit for large customer lists
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // --- Session setup ---
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'super-secret',
+  secret: process.env.SESSION_SECRET || 'super-secret-key-change-this',
   resave: false,
-  saveUninitialized: true
+  saveUninitialized: true,
+  cookie: { secure: process.env.NODE_ENV === 'production' }
 }));
 
-// --- Helper functions (replace with real DB logic) ---
-const tokensDB = {}; // demo in-memory storage
+// ==========================================
+//  HELPER FUNCTIONS (Token Management)
+// ==========================================
 
+// In-Memory Cache (Fast access, wipes on restart)
+let tokensDB = {}; 
+
+/**
+ * Save tokens to local memory.
+ * Note: Persistence to Airtable happens via the n8n webhook call in the OAuth callback.
+ */
 async function saveTokensToDB({ userId, access_token, refresh_token, expires_at }) {
   tokensDB[userId] = { access_token, refresh_token, expires_at };
+  console.log(`Tokens cached in memory for User: ${userId}`);
 }
 
+/**
+ * Retrieve tokens.
+ * 1. Checks local memory first (Fast).
+ * 2. If missing (e.g., after server restart), fetches from n8n/Airtable.
+ */
 async function getTokensFromDB(userId) {
-  return tokensDB[userId];
+  // 1. Try Memory
+  if (tokensDB[userId]) {
+    return tokensDB[userId];
+  }
+
+  // 2. Try Fetching from Cloud (n8n -> Airtable)
+  console.log(`Cache miss for ${userId}. Fetching tokens from n8n/Airtable...`);
+  try {
+    // YOU MUST CREATE THIS WEBHOOK IN n8n:
+    // Method: GET
+    // Path: /webhook/get-user-tokens
+    // Parameter: ?userId=...
+    // Response: JSON { "access_token": "...", "refresh_token": "...", "expires_at": ... }
+    const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/get-user-tokens?userId=${encodeURIComponent(userId)}`);
+    
+    if (!response.ok) {
+        console.error(`n8n returned ${response.status} for token fetch`);
+        return null;
+    }
+    
+    const data = await response.json();
+    
+    // Validate response
+    if (data && data.access_token) {
+        // Save to memory so we don't have to fetch next time
+        tokensDB[userId] = {
+            access_token: data.access_token,
+            refresh_token: data.refresh_token,
+            expires_at: data.expires_at || (Date.now() + 3500 * 1000)
+        };
+        console.log(`Tokens restored from cloud for User: ${userId}`);
+        return tokensDB[userId];
+    }
+    
+    return null;
+  } catch (error) {
+    console.error("Error fetching tokens from n8n:", error.message);
+    return null;
+  }
 }
+
+// ==========================================
+//  API ENDPOINTS
+// ==========================================
 
 // --- 1. Proxy GET User Data ---
 app.get('/api/userdata/:flowid', async (req, res) => {
@@ -71,7 +128,7 @@ app.post('/api/updatecustomers', async (req, res) => {
   }
 });
 
-// --- 3. Proxy POST Create Table ---
+// --- 3. Proxy POST Create Table (Legacy) ---
 app.post('/api/createtable', async (req, res) => {
   const { userid, name } = req.body;
   try {
@@ -97,6 +154,8 @@ app.post('/api/updatetemplates', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userid, templates })
     });
+    
+    // Handle responses that might not be JSON
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
@@ -113,18 +172,31 @@ app.post('/api/updatetemplates', async (req, res) => {
 // --- 5. Proxy POST Send Automated Messages ---
 app.post('/api/send-automated-messages', async (req, res) => {
   try {
-    const { userId, emailData } = req.body;
+    const { userId, ...campaignData } = req.body;
 
-    // Retrieve Gmail access_token from DB
+    if (!userId) {
+        return res.status(400).json({ error: 'Missing userId in request' });
+    }
+
+    // 1. Retrieve Gmail access_token (Memory or Cloud)
     const userTokens = await getTokensFromDB(userId);
-    if (!userTokens) return res.status(400).json({ error: 'User Gmail not connected' });
+    
+    if (!userTokens) {
+        console.warn(`Attempt to send email failed: No tokens found for user ${userId}`);
+        return res.status(400).json({ error: 'User Gmail not connected or tokens expired. Please reconnect.' });
+    }
 
-    // Include token in payload to n8n
+    // 2. Construct the Payload for n8n
     const payload = {
-      ...emailData,
-      access_token: userTokens.access_token
+      userId: userId,
+      ...campaignData,
+      access_token: userTokens.access_token,
+      refresh_token: userTokens.refresh_token // Optional: Send refresh token if n8n handles rotation
     };
 
+    console.log(`Sending campaign for User ${userId} to n8n...`);
+
+    // 3. Send to n8n
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/send-automated-messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -136,58 +208,81 @@ app.post('/api/send-automated-messages', async (req, res) => {
         const data = await response.json();
         res.json(data);
     } else {
-        res.json({ success: true, message: 'Messages queued' });
+        res.json({ success: true, message: 'Messages queued successfully' });
     }
+
   } catch (err) {
     console.error('Send Messages Error:', err);
     res.status(500).json({ error: 'Failed to send messages' });
   }
 });
 
-// --- 6. Simple GET endpoint ---
+// --- 6. Simple GET endpoint (Health Check) ---
 app.get('/get', (req, res) => {
-  res.json('Welcome To HTTP REQUEST CLASS');
+  res.json('Backend is Online');
 });
 
-// --- 7. Receive email (example) ---
+// --- 7. Receive email (Webhook Endpoint) ---
 app.post('/api/receive-email', (req, res) => {
   const emailData = req.body;
-  console.log('Email received:', emailData);
+  console.log('Email received webhook:', emailData);
   res.status(200).send({ success: true });
 });
 
-// --- 8. Google OAuth connect ---
+// --- 8. Inbox Proxy (Fetch messages) ---
+// Note: You might need to implement this endpoint if your frontend calls /api/inbox
+app.get('/api/inbox', async (req, res) => {
+    // Mock response or proxy to n8n if implemented
+    // For now returning empty array or you can wire it to n8n
+    res.json([]); 
+});
+
+// ==========================================
+//  GOOGLE OAUTH FLOW
+// ==========================================
+
+// --- 9. Google OAuth Connect (Start) ---
 app.get('/api/google/connect', (req, res) => {
+  const userId = req.query.userId; 
+  if (!userId) {
+    return res.status(400).send("Missing userId. Cannot link account.");
+  }
+
   const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
   const clientId = process.env.GOOGLE_CLIENT_ID;
+  
+  // Scopes: OpenID, Email, Profile, Send Gmail, Read Gmail
   const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly');
 
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent`;
-
+  // Pass userId in state so we know who is connecting
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${userId}`;
+  
   res.redirect(authUrl);
 });
 
-// --- 9. Google OAuth callback (UPDATED) ---
+// --- 10. Google OAuth Callback (Finish) ---
 app.get('/api/google/oauth/callback', async (req, res) => {
   const code = req.query.code;
+  const userId = req.query.state; 
+
   if (!code) return res.status(400).send("No code provided");
+  if (!userId) return res.status(400).send("No userId returned in state parameter");
 
   try {
-    // 1. Exchange code for tokens from Google
-    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', {
-      code: code,
-      client_id: process.env.GOOGLE_CLIENT_ID,
-      client_secret: process.env.GOOGLE_CLIENT_SECRET,
-      redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
-      grant_type: 'authorization_code'
+    // 1. Exchange Code for Tokens
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', null, {
+      params: {
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
+        grant_type: 'authorization_code'
+      }
     });
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
-
-    // 2. Identify the user (In production, use real session ID)
-    const userId = req.session.userId || 'demo-user'; // fallback for demo
     
-    // 3. Save to Local DB (Optional, if you want to keep a copy)
+    // 2. Save to Local DB (Cache)
     await saveTokensToDB({
       userId,
       access_token,
@@ -195,22 +290,22 @@ app.get('/api/google/oauth/callback', async (req, res) => {
       expires_at: Date.now() + expires_in * 1000
     });
 
-    // 4. CRITICAL: Send Keys to n8n Webhook
-    // This allows n8n to store the credentials for automation
+    // 3. Send credentials to n8n (Persist to Airtable)
     try {
+        console.log(`Sending credentials to n8n for User: ${userId}`);
         await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
-            userId: userId,
+            userId: userId, 
             google_access_token: access_token,
-            google_refresh_token: refresh_token,
-            token_expiry: Date.now() + expires_in * 1000
+            google_refresh_token: refresh_token || "ALREADY_AUTHORIZED", 
+            token_expiry: Date.now() + expires_in * 1000,
+            timestamp: new Date().toISOString()
         });
-        console.log("Keys successfully sent to n8n");
     } catch (n8nError) {
         console.error("Failed to send keys to n8n:", n8nError.message);
-        // We don't stop the flow here, just log the error
+        // We continue anyway because we have them in memory for now
     }
 
-    // 5. Redirect back to Frontend
+    // 4. Redirect back to Frontend
     res.redirect('https://seraphielspark.github.io/flowon/flow.html?status=connected');
 
   } catch (err) {
@@ -218,4 +313,6 @@ app.get('/api/google/oauth/callback', async (req, res) => {
     res.status(500).send("Failed to connect Gmail");
   }
 });
+
+// --- Start Server ---
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
