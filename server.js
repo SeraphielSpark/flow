@@ -96,15 +96,14 @@ app.get('/api/userdata/:flowid', async (req, res) => {
 
 // --- 2. Proxy POST Update Customers ---
 app.post('/api/updatecustomers', async (req, res) => {
-  const { userId, customers, templates } = req.body;
+  const { userId, customers } = req.body;
   try {
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/updatecustomers`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
         userid: userId,
-        customers: JSON.stringify(customers),
-        templates: JSON.stringify(templates)
+        customers: JSON.stringify(customers)        
       })
     });
     const data = await response.json();
@@ -332,3 +331,4 @@ app.post('/api/sync-user/:flowid', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
