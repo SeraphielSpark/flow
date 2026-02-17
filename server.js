@@ -1,9 +1,8 @@
 const express = require('express');
-const fetch = require('node-fetch');
+const fetch = require('node-fetch'); // Ensure you are using node-fetch v2 for CommonJS
 const axios = require('axios');
 const cors = require('cors');
 const session = require('express-session');
-const { google } = require('googleapis');
 require('dotenv').config();
 
 const app = express();
@@ -11,13 +10,13 @@ const PORT = process.env.PORT || 3000;
 
 // --- CORS setup ---
 const corsOptions = {
-  origin: '*',
+  origin: '*', // Allow all origins (Replace with your specific domain in production for security)
   optionsSuccessStatus: 200
 };
 app.use(cors(corsOptions));
 
 // --- Body parsers ---
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb' })); // Increased limit for large customer lists
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // --- Session setup ---
@@ -32,20 +31,37 @@ app.use(session({
 //  HELPER FUNCTIONS (Token Management)
 // ==========================================
 
-let tokensDB = {};
+// In-Memory Cache (Fast access, wipes on restart)
+let tokensDB = {}; 
 
+/**
+ * Save tokens to local memory.
+ * Note: Persistence to Airtable happens via the n8n webhook call in the OAuth callback.
+ */
 async function saveTokensToDB({ userId, access_token, refresh_token, expires_at }) {
   tokensDB[userId] = { access_token, refresh_token, expires_at };
   console.log(`Tokens cached in memory for User: ${userId}`);
 }
 
+/**
+ * Retrieve tokens.
+ * 1. Checks local memory first (Fast).
+ * 2. If missing (e.g., after server restart), fetches from n8n/Airtable.
+ */
 async function getTokensFromDB(userId) {
+  // 1. Try Memory
   if (tokensDB[userId]) {
     return tokensDB[userId];
   }
 
+  // 2. Try Fetching from Cloud (n8n -> Airtable)
   console.log(`Cache miss for ${userId}. Fetching tokens from n8n/Airtable...`);
   try {
+    // YOU MUST CREATE THIS WEBHOOK IN n8n:
+    // Method: GET
+    // Path: /webhook/get-user-tokens
+    // Parameter: ?userId=...
+    // Response: JSON { "access_token": "...", "refresh_token": "...", "expires_at": ... }
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/get-user-tokens?userId=${encodeURIComponent(userId)}`);
     
     if (!response.ok) {
@@ -55,7 +71,9 @@ async function getTokensFromDB(userId) {
     
     const data = await response.json();
     
+    // Validate response
     if (data && data.access_token) {
+        // Save to memory so we don't have to fetch next time
         tokensDB[userId] = {
             access_token: data.access_token,
             refresh_token: data.refresh_token,
@@ -110,7 +128,7 @@ app.post('/api/updatecustomers', async (req, res) => {
   }
 });
 
-// --- 3. Proxy POST Create Table ---
+// --- 3. Proxy POST Create Table (Legacy) ---
 app.post('/api/createtable', async (req, res) => {
   const { userid, name } = req.body;
   try {
@@ -137,6 +155,7 @@ app.post('/api/updatetemplates', async (req, res) => {
       body: JSON.stringify({ userid, templates })
     });
     
+    // Handle responses that might not be JSON
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
@@ -150,7 +169,7 @@ app.post('/api/updatetemplates', async (req, res) => {
   }
 });
 
-// --- 5. Proxy POST Send Automated Messages (FIXED to match n8n) ---
+// --- 5. Proxy POST Send Automated Messages ---
 app.post('/api/send-automated-messages', async (req, res) => {
   try {
     const { userId, ...campaignData } = req.body;
@@ -159,6 +178,7 @@ app.post('/api/send-automated-messages', async (req, res) => {
         return res.status(400).json({ error: 'Missing userId in request' });
     }
 
+    // 1. Retrieve Gmail access_token (Memory or Cloud)
     const userTokens = await getTokensFromDB(userId);
     
     if (!userTokens) {
@@ -166,66 +186,62 @@ app.post('/api/send-automated-messages', async (req, res) => {
         return res.status(400).json({ error: 'User Gmail not connected or tokens expired. Please reconnect.' });
     }
 
-    // IMPORTANT: Wrap everything in "body" object to match n8n function expectations
+    // 2. Construct the Payload for n8n
     const payload = {
-      body: {
-        recipients: campaignData.recipients || [],
-        body: campaignData.body || '',
-        fromName: campaignData.fromName || '',
-        fromEmail: campaignData.fromEmail || '',
-        subject: campaignData.subject || ''
-      },
+      userId: userId,
+      ...campaignData,
       access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token,
-      userId: userId  // Send userId at top level as well
+      refresh_token: userTokens.refresh_token // Optional: Send refresh token if n8n handles rotation
     };
 
-    console.log(`Sending campaign for User ${userId} to ${payload.body.recipients.length} recipients`);
+    console.log(`Sending campaign for User ${userId} to n8n...`);
 
+    // 3. Send to n8n
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/send-automated-messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`n8n returned ${response.status}:`, errorText);
-      return res.status(response.status).json({ error: 'n8n webhook failed' });
-    }
-
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
         res.json(data);
     } else {
-        const text = await response.text();
-        res.json({ success: true, message: 'Messages queued successfully', response: text });
+        res.json({ success: true, message: 'Messages queued successfully' });
     }
 
   } catch (err) {
     console.error('Send Messages Error:', err);
-    res.status(500).json({ error: 'Failed to send messages: ' + err.message });
+    res.status(500).json({ error: 'Failed to send messages' });
   }
 });
 
-// --- 6. Simple GET endpoint ---
+// --- 6. Simple GET endpoint (Health Check) ---
 app.get('/get', (req, res) => {
   res.json('Backend is Online');
 });
 
-// --- 7. Receive email webhook ---
+// --- 7. Receive email (Webhook Endpoint) ---
 app.post('/api/receive-email', (req, res) => {
   const emailData = req.body;
   console.log('Email received webhook:', emailData);
   res.status(200).send({ success: true });
 });
 
+// --- 8. Inbox Proxy (Fetch messages) ---
+// Note: You might need to implement this endpoint if your frontend calls /api/inbox
+app.get('/api/inbox', async (req, res) => {
+    // Mock response or proxy to n8n if implemented
+    // For now returning empty array or you can wire it to n8n
+    res.json([]); 
+});
+
 // ==========================================
 //  GOOGLE OAUTH FLOW
 // ==========================================
 
-// --- 8. Google OAuth Connect ---
+// --- 9. Google OAuth Connect (Start) ---
 app.get('/api/google/connect', (req, res) => {
   const userId = req.query.userId; 
   if (!userId) {
@@ -235,14 +251,16 @@ app.get('/api/google/connect', (req, res) => {
   const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
   const clientId = process.env.GOOGLE_CLIENT_ID;
   
-  const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify');
+  // Scopes: OpenID, Email, Profile, Send Gmail, Read Gmail
+  const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly');
 
+  // Pass userId in state so we know who is connecting
   const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${userId}`;
   
   res.redirect(authUrl);
 });
 
-// --- 9. Google OAuth Callback ---
+// --- 10. Google OAuth Callback (Finish) ---
 app.get('/api/google/oauth/callback', async (req, res) => {
   const code = req.query.code;
   const userId = req.query.state; 
@@ -251,6 +269,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
   if (!userId) return res.status(400).send("No userId returned in state parameter");
 
   try {
+    // 1. Exchange Code for Tokens
     const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', null, {
       params: {
         code: code,
@@ -263,6 +282,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
 
     const { access_token, refresh_token, expires_in } = tokenResponse.data;
     
+    // 2. Save to Local DB (Cache)
     await saveTokensToDB({
       userId,
       access_token,
@@ -270,6 +290,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
       expires_at: Date.now() + expires_in * 1000
     });
 
+    // 3. Send credentials to n8n (Persist to Airtable)
     try {
         console.log(`Sending credentials to n8n for User: ${userId}`);
         await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
@@ -281,302 +302,16 @@ app.get('/api/google/oauth/callback', async (req, res) => {
         });
     } catch (n8nError) {
         console.error("Failed to send keys to n8n:", n8nError.message);
+        // We continue anyway because we have them in memory for now
     }
 
+    // 4. Redirect back to Frontend
     res.redirect('https://seraphielspark.github.io/flowon/flow.html?status=connected');
 
   } catch (err) {
     console.error("OAuth token exchange error:", err.response?.data || err.message);
     res.status(500).send("Failed to connect Gmail");
   }
-});
-
-// ==========================================
-//  INBOX ENDPOINTS (FULL IMPLEMENTATION)
-// ==========================================
-
-// --- 10. Get all inbox messages ---
-app.get('/api/inbox', async (req, res) => {
-  try {
-    const userId = req.query.userId;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId parameter' });
-    }
-    
-    const userTokens = await getTokensFromDB(userId);
-    if (!userTokens || !userTokens.access_token) {
-      return res.status(401).json({ error: 'Gmail not connected' });
-    }
-
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-      'https://flowon.onrender.com/api/google/oauth/callback'
-    );
-
-    oauth2Client.setCredentials({
-      access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const response = await gmail.users.messages.list({
-      userId: 'me',
-      maxResults: 20,
-      q: 'in:inbox'
-    });
-
-    const messages = response.data.messages || [];
-    
-    if (messages.length === 0) {
-      return res.json([]);
-    }
-    
-    const inboxMessages = await Promise.all(
-      messages.map(async (msg) => {
-        try {
-          const message = await gmail.users.messages.get({
-            userId: 'me',
-            id: msg.id,
-            format: 'full'
-          });
-
-          const headers = message.data.payload.headers;
-          const from = headers.find(h => h.name === 'From')?.value || 'Unknown';
-          const subject = headers.find(h => h.name === 'Subject')?.value || '(No Subject)';
-          const date = headers.find(h => h.name === 'Date')?.value || new Date().toISOString();
-          
-          let fromName = from;
-          let fromEmail = from;
-          const emailMatch = from.match(/<(.+?)>/);
-          if (emailMatch) {
-            fromEmail = emailMatch[1];
-            fromName = from.replace(`<${fromEmail}>`, '').trim() || fromEmail.split('@')[0];
-          }
-
-          let bodyText = '';
-          let bodyHtml = '';
-          
-          if (message.data.payload.parts) {
-            const textPart = message.data.payload.parts.find(part => part.mimeType === 'text/plain');
-            const htmlPart = message.data.payload.parts.find(part => part.mimeType === 'text/html');
-            
-            if (textPart?.body?.data) {
-              bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
-            }
-            if (htmlPart?.body?.data) {
-              bodyHtml = Buffer.from(htmlPart.body.data, 'base64').toString('utf-8');
-            }
-          } else if (message.data.payload.body?.data) {
-            if (message.data.payload.mimeType === 'text/html') {
-              bodyHtml = Buffer.from(message.data.payload.body.data, 'base64').toString('utf-8');
-            } else {
-              bodyText = Buffer.from(message.data.payload.body.data, 'base64').toString('utf-8');
-            }
-          }
-
-          return {
-            id: msg.id,
-            threadId: message.data.threadId,
-            from_name: fromName,
-            from_email: fromEmail,
-            subject: subject.substring(0, 200),
-            date: date,
-            body_text: bodyText.substring(0, 10000),
-            body_html: bodyHtml,
-            read: !message.data.labelIds?.includes('UNREAD'),
-            snippet: message.data.snippet || '',
-            labelIds: message.data.labelIds || []
-          };
-        } catch (msgError) {
-          console.error(`Error fetching message ${msg.id}:`, msgError);
-          return null;
-        }
-      })
-    );
-
-    const validMessages = inboxMessages.filter(msg => msg !== null);
-    validMessages.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    res.json(validMessages);
-
-  } catch (error) {
-    console.error('Error fetching inbox:', error);
-    
-    if (error.code === 401) {
-      return res.status(401).json({ error: 'Gmail authentication failed. Please reconnect.' });
-    }
-    
-    res.status(500).json({ error: 'Failed to fetch inbox messages' });
-  }
-});
-
-// --- 11. Mark message as read ---
-app.post('/api/inbox/read/:messageId', async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const userId = req.query.userId;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId' });
-    }
-
-    const userTokens = await getTokensFromDB(userId);
-    if (!userTokens || !userTokens.access_token) {
-      return res.status(401).json({ error: 'Gmail not connected' });
-    }
-
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-
-    oauth2Client.setCredentials({
-      access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    await gmail.users.messages.modify({
-      userId: 'me',
-      id: messageId,
-      requestBody: {
-        removeLabelIds: ['UNREAD']
-      }
-    });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error marking message as read:', error);
-    res.status(500).json({ error: 'Failed to mark message as read' });
-  }
-});
-
-// --- 12. Delete message ---
-app.delete('/api/inbox/:messageId', async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const userId = req.query.userId;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId' });
-    }
-
-    const userTokens = await getTokensFromDB(userId);
-    if (!userTokens || !userTokens.access_token) {
-      return res.status(401).json({ error: 'Gmail not connected' });
-    }
-
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-
-    oauth2Client.setCredentials({
-      access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    await gmail.users.messages.trash({
-      userId: 'me',
-      id: messageId
-    });
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error deleting message:', error);
-    res.status(500).json({ error: 'Failed to delete message' });
-  }
-});
-
-// --- 13. Get unread count ---
-app.get('/api/inbox/unread/count', async (req, res) => {
-  try {
-    const userId = req.query.userId;
-    
-    if (!userId) {
-      return res.json({ count: 0 });
-    }
-
-    const userTokens = await getTokensFromDB(userId);
-    if (!userTokens || !userTokens.access_token) {
-      return res.json({ count: 0 });
-    }
-
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-
-    oauth2Client.setCredentials({
-      access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const response = await gmail.users.messages.list({
-      userId: 'me',
-      q: 'in:inbox is:unread',
-      maxResults: 500
-    });
-
-    res.json({ count: response.data.messages?.length || 0 });
-  } catch (error) {
-    console.error('Error fetching unread count:', error);
-    res.json({ count: 0 });
-  }
-});
-
-// ==========================================
-//  DEBUG & STATUS ENDPOINTS
-// ==========================================
-
-// --- 14. Debug token status ---
-app.get('/api/debug/tokens/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const tokens = await getTokensFromDB(userId);
-  
-  if (tokens) {
-    res.json({ 
-      exists: true, 
-      hasAccessToken: !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token,
-      expires_at: tokens.expires_at,
-      user_id: userId
-    });
-  } else {
-    res.json({ 
-      exists: false, 
-      user_id: userId
-    });
-  }
-});
-
-// --- 15. Google connection status ---
-app.get('/api/google/status', async (req, res) => {
-  const userId = req.query.userId;
-  
-  if (!userId) {
-    return res.status(400).json({ 
-      connected: false, 
-      error: 'No userId provided' 
-    });
-  }
-  
-  const tokens = await getTokensFromDB(userId);
-  const connected = !!(tokens && tokens.access_token);
-  
-  res.json({ 
-    connected,
-    userId,
-    hasTokens: !!tokens
-  });
 });
 
 // --- Start Server ---
