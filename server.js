@@ -34,6 +34,7 @@ app.use(session({
 
 let tokensDB = {};
 let whatsappDB = {}; // Store WhatsApp numbers
+let lastMessageCheck = {}; // Track last checked messages per user
 
 async function saveTokensToDB({ userId, access_token, refresh_token, expires_at }) {
   tokensDB[userId] = { access_token, refresh_token, expires_at };
@@ -99,6 +100,54 @@ async function saveWhatsAppNumber(userId, phoneNumber) {
 
 async function getWhatsAppNumber(userId) {
   return whatsappDB[userId];
+}
+
+// ==========================================
+//  WHATSAPP NOTIFICATION HELPER
+// ==========================================
+
+async function sendWhatsAppNotification(userId, messageDetails) {
+  try {
+    const whatsapp = await getWhatsAppNumber(userId);
+    
+    if (!whatsapp) {
+      console.log(`No WhatsApp registered for user ${userId}, skipping notification`);
+      return false;
+    }
+
+    const { from, subject, snippet, messageId } = messageDetails;
+    
+    // Format message for WhatsApp
+    const whatsappMessage = `📧 *New Message Received*\n\n*From:* ${from}\n*Subject:* ${subject}\n\n*Preview:* ${snippet || 'No preview available'}\n\nCheck your inbox for more details.`;
+    
+    const payload = {
+      to: whatsapp.phoneNumber,
+      message: whatsappMessage,
+      from: from,
+      subject: subject,
+      userId: userId,
+      messageId: messageId,
+      type: 'new_email_notification',
+      timestamp: new Date().toISOString()
+    };
+    
+    const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/receive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`n8n returned ${response.status}`);
+    }
+    
+    console.log(`WhatsApp notification sent to user ${userId} for message ${messageId}`);
+    return true;
+    
+  } catch (error) {
+    console.error('WhatsApp notification error:', error);
+    return false;
+  }
 }
 
 // ==========================================
@@ -205,20 +254,20 @@ app.post('/api/send-automated-messages', async (req, res) => {
         return res.status(400).json({ error: 'User Gmail not connected or tokens expired. Please reconnect.' });
     }
 
+    // Send FLAT structure - NO extra "body" wrapper
+    // n8n will automatically put this inside $json.body
     const payload = {
-      body: {
-        recipients: campaignData.recipients || [],
-        body: campaignData.body || '',
-        fromName: campaignData.fromName || '',
-        fromEmail: campaignData.fromEmail || '',
-        subject: campaignData.subject || ''
-      },
+      recipients: campaignData.recipients || [],
+      body: campaignData.body || '',
+      fromName: campaignData.fromName || '',
+      fromEmail: campaignData.fromEmail || '',
+      subject: campaignData.subject || '',
       access_token: userTokens.access_token,
       refresh_token: userTokens.refresh_token,
       userId: userId
     };
 
-    console.log(`Sending campaign for User ${userId} to ${payload.body.recipients.length} recipients`);
+    console.log(`Sending campaign for User ${userId} to ${payload.recipients.length} recipients`);
 
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/send-automated-messages`, {
       method: 'POST',
@@ -367,37 +416,18 @@ app.post('/api/whatsapp/notify-new-message', async (req, res) => {
   try {
     const { userId, messageId, from, subject, snippet } = req.body;
     
-    const whatsapp = await getWhatsAppNumber(userId);
-    
-    if (!whatsapp) {
-      return res.json({ skipped: true, reason: 'No WhatsApp number registered' });
-    }
-    
-    // Format message for WhatsApp
-    const whatsappMessage = `📧 *New Message Received*\n\n*From:* ${from}\n*Subject:* ${subject}\n\n*Preview:* ${snippet || 'No preview available'}\n\nCheck your inbox for more details.`;
-    
-    const payload = {
-      to: whatsapp.phoneNumber,
-      message: whatsappMessage,
-      from: from,
-      subject: subject,
-      userId: userId,
-      messageId: messageId,
-      type: 'new_email_notification',
-      timestamp: new Date().toISOString()
-    };
-    
-    const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/receive`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+    const result = await sendWhatsAppNotification(userId, {
+      from,
+      subject,
+      snippet,
+      messageId
     });
     
-    if (!response.ok) {
-      throw new Error(`n8n returned ${response.status}`);
+    if (result) {
+      res.json({ success: true, message: 'WhatsApp notification sent' });
+    } else {
+      res.json({ skipped: true, reason: 'No WhatsApp number registered or send failed' });
     }
-    
-    res.json({ success: true, message: 'WhatsApp notification sent' });
     
   } catch (error) {
     console.error('WhatsApp notification error:', error);
@@ -476,7 +506,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
 });
 
 // ==========================================
-//  INBOX ENDPOINTS
+//  INBOX ENDPOINTS (WITH AUTO WHATSAPP NOTIFICATIONS)
 // ==========================================
 
 // --- 14. Get all inbox messages ---
@@ -531,6 +561,7 @@ app.get('/api/inbox', async (req, res) => {
           const from = headers.find(h => h.name === 'From')?.value || 'Unknown';
           const subject = headers.find(h => h.name === 'Subject')?.value || '(No Subject)';
           const date = headers.find(h => h.name === 'Date')?.value || new Date().toISOString();
+          const isRead = !message.data.labelIds?.includes('UNREAD');
           
           let fromName = from;
           let fromEmail = from;
@@ -570,7 +601,7 @@ app.get('/api/inbox', async (req, res) => {
             date: date,
             body_text: bodyText.substring(0, 10000),
             body_html: bodyHtml,
-            read: !message.data.labelIds?.includes('UNREAD'),
+            read: isRead,
             snippet: message.data.snippet || '',
             labelIds: message.data.labelIds || []
           };
@@ -584,12 +615,40 @@ app.get('/api/inbox', async (req, res) => {
     const validMessages = inboxMessages.filter(msg => msg !== null);
     validMessages.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Check for new messages and trigger WhatsApp notifications
+    // AUTO WHATSAPP NOTIFICATION FOR NEW MESSAGES
+    // Check for new unread messages and send WhatsApp notifications
     const whatsapp = await getWhatsAppNumber(userId);
-    if (whatsapp && validMessages.length > 0) {
-      // You could implement logic to only notify for new messages
-      // For now, we'll just log it
-      console.log(`User ${userId} has ${validMessages.length} messages, WhatsApp connected: ${whatsapp.phoneNumber}`);
+    if (whatsapp) {
+      // Get unread messages
+      const unreadMessages = validMessages.filter(msg => !msg.read);
+      
+      if (unreadMessages.length > 0) {
+        console.log(`Found ${unreadMessages.length} unread messages for user ${userId}`);
+        
+        // Initialize last checked for this user if not exists
+        if (!lastMessageCheck[userId]) {
+          lastMessageCheck[userId] = {};
+        }
+        
+        // Check each unread message
+        for (const msg of unreadMessages) {
+          // If we haven't notified for this message yet
+          if (!lastMessageCheck[userId][msg.id]) {
+            console.log(`New message detected for user ${userId}: ${msg.id}`);
+            
+            // Send WhatsApp notification
+            await sendWhatsAppNotification(userId, {
+              from: msg.from_name || msg.from_email,
+              subject: msg.subject,
+              snippet: msg.snippet,
+              messageId: msg.id
+            });
+            
+            // Mark as notified
+            lastMessageCheck[userId][msg.id] = Date.now();
+          }
+        }
+      }
     }
 
     res.json(validMessages);
@@ -769,6 +828,17 @@ app.get('/api/google/status', async (req, res) => {
     userId,
     hasTokens: !!tokens
   });
+});
+
+// --- 20. Debug endpoint to clear message check history (for testing) ---
+app.post('/api/debug/clear-message-history/:userId', (req, res) => {
+  const { userId } = req.params;
+  if (lastMessageCheck[userId]) {
+    delete lastMessageCheck[userId];
+    res.json({ success: true, message: `Message history cleared for user ${userId}` });
+  } else {
+    res.json({ success: false, message: `No history found for user ${userId}` });
+  }
 });
 
 // --- Start Server ---
