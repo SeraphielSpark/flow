@@ -32,7 +32,6 @@ app.use(session({
 //  HELPER FUNCTIONS (Token Management)
 // ==========================================
 
-// In-Memory Cache
 let tokensDB = {};
 
 async function saveTokensToDB({ userId, access_token, refresh_token, expires_at }) {
@@ -151,7 +150,7 @@ app.post('/api/updatetemplates', async (req, res) => {
   }
 });
 
-// --- 5. Proxy POST Send Automated Messages (KEEP EXACTLY AS IS - WORKING VERSION) ---
+// --- 5. Proxy POST Send Automated Messages (FIXED to match n8n) ---
 app.post('/api/send-automated-messages', async (req, res) => {
   try {
     const { userId, ...campaignData } = req.body;
@@ -167,14 +166,21 @@ app.post('/api/send-automated-messages', async (req, res) => {
         return res.status(400).json({ error: 'User Gmail not connected or tokens expired. Please reconnect.' });
     }
 
+    // IMPORTANT: Wrap everything in "body" object to match n8n function expectations
     const payload = {
-      userId: userId,
-      ...campaignData,
+      body: {
+        recipients: campaignData.recipients || [],
+        body: campaignData.body || '',
+        fromName: campaignData.fromName || '',
+        fromEmail: campaignData.fromEmail || '',
+        subject: campaignData.subject || ''
+      },
       access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
+      refresh_token: userTokens.refresh_token,
+      userId: userId  // Send userId at top level as well
     };
 
-    console.log(`Sending campaign for User ${userId} to n8n...`);
+    console.log(`Sending campaign for User ${userId} to ${payload.body.recipients.length} recipients`);
 
     const response = await fetch(`https://kingoftech.app.n8n.cloud/webhook/send-automated-messages`, {
       method: 'POST',
@@ -182,17 +188,24 @@ app.post('/api/send-automated-messages', async (req, res) => {
       body: JSON.stringify(payload)
     });
 
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`n8n returned ${response.status}:`, errorText);
+      return res.status(response.status).json({ error: 'n8n webhook failed' });
+    }
+
     const contentType = response.headers.get("content-type");
     if (contentType && contentType.indexOf("application/json") !== -1) {
         const data = await response.json();
         res.json(data);
     } else {
-        res.json({ success: true, message: 'Messages queued successfully' });
+        const text = await response.text();
+        res.json({ success: true, message: 'Messages queued successfully', response: text });
     }
 
   } catch (err) {
     console.error('Send Messages Error:', err);
-    res.status(500).json({ error: 'Failed to send messages' });
+    res.status(500).json({ error: 'Failed to send messages: ' + err.message });
   }
 });
 
@@ -279,7 +292,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
 });
 
 // ==========================================
-//  INBOX ENDPOINTS (ADDED WITHOUT BREAKING ANYTHING)
+//  INBOX ENDPOINTS (FULL IMPLEMENTATION)
 // ==========================================
 
 // --- 10. Get all inbox messages ---
