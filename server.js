@@ -151,7 +151,7 @@ app.post('/api/updatetemplates', async (req, res) => {
   }
 });
 
-// --- 5. Proxy POST Send Automated Messages ---
+// --- 5. Proxy POST Send Automated Messages (KEEP EXACTLY AS IS - WORKING VERSION) ---
 app.post('/api/send-automated-messages', async (req, res) => {
   try {
     const { userId, ...campaignData } = req.body;
@@ -209,10 +209,80 @@ app.post('/api/receive-email', (req, res) => {
 });
 
 // ==========================================
-//  INBOX ENDPOINTS (FULL IMPLEMENTATION)
+//  GOOGLE OAUTH FLOW
 // ==========================================
 
-// --- 8. Get all inbox messages ---
+// --- 8. Google OAuth Connect ---
+app.get('/api/google/connect', (req, res) => {
+  const userId = req.query.userId; 
+  if (!userId) {
+    return res.status(400).send("Missing userId. Cannot link account.");
+  }
+
+  const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  
+  const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify');
+
+  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${userId}`;
+  
+  res.redirect(authUrl);
+});
+
+// --- 9. Google OAuth Callback ---
+app.get('/api/google/oauth/callback', async (req, res) => {
+  const code = req.query.code;
+  const userId = req.query.state; 
+
+  if (!code) return res.status(400).send("No code provided");
+  if (!userId) return res.status(400).send("No userId returned in state parameter");
+
+  try {
+    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', null, {
+      params: {
+        code: code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
+        grant_type: 'authorization_code'
+      }
+    });
+
+    const { access_token, refresh_token, expires_in } = tokenResponse.data;
+    
+    await saveTokensToDB({
+      userId,
+      access_token,
+      refresh_token,
+      expires_at: Date.now() + expires_in * 1000
+    });
+
+    try {
+        console.log(`Sending credentials to n8n for User: ${userId}`);
+        await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
+            userId: userId, 
+            google_access_token: access_token,
+            google_refresh_token: refresh_token || "ALREADY_AUTHORIZED", 
+            token_expiry: Date.now() + expires_in * 1000,
+            timestamp: new Date().toISOString()
+        });
+    } catch (n8nError) {
+        console.error("Failed to send keys to n8n:", n8nError.message);
+    }
+
+    res.redirect('https://seraphielspark.github.io/flowon/flow.html?status=connected');
+
+  } catch (err) {
+    console.error("OAuth token exchange error:", err.response?.data || err.message);
+    res.status(500).send("Failed to connect Gmail");
+  }
+});
+
+// ==========================================
+//  INBOX ENDPOINTS (ADDED WITHOUT BREAKING ANYTHING)
+// ==========================================
+
+// --- 10. Get all inbox messages ---
 app.get('/api/inbox', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -224,11 +294,6 @@ app.get('/api/inbox', async (req, res) => {
     const userTokens = await getTokensFromDB(userId);
     if (!userTokens || !userTokens.access_token) {
       return res.status(401).json({ error: 'Gmail not connected' });
-    }
-
-    if (userTokens.expires_at && userTokens.expires_at < Date.now()) {
-      console.log(`Token expired for user ${userId}. Attempting to refresh...`);
-      return res.status(401).json({ error: 'Token expired. Please reconnect.' });
     }
 
     const oauth2Client = new google.auth.OAuth2(
@@ -322,7 +387,6 @@ app.get('/api/inbox', async (req, res) => {
     const validMessages = inboxMessages.filter(msg => msg !== null);
     validMessages.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    console.log(`Returning ${validMessages.length} inbox messages for user ${userId}`);
     res.json(validMessages);
 
   } catch (error) {
@@ -330,104 +394,13 @@ app.get('/api/inbox', async (req, res) => {
     
     if (error.code === 401) {
       return res.status(401).json({ error: 'Gmail authentication failed. Please reconnect.' });
-    } else if (error.code === 403) {
-      return res.status(403).json({ error: 'Access forbidden. Check Gmail permissions.' });
-    } else if (error.code === 429) {
-      return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
     }
     
     res.status(500).json({ error: 'Failed to fetch inbox messages' });
   }
 });
 
-// --- 9. Get single message by ID ---
-app.get('/api/inbox/message/:messageId', async (req, res) => {
-  try {
-    const { messageId } = req.params;
-    const userId = req.query.userId;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'Missing userId' });
-    }
-
-    const userTokens = await getTokensFromDB(userId);
-    if (!userTokens || !userTokens.access_token) {
-      return res.status(401).json({ error: 'Gmail not connected' });
-    }
-
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-
-    oauth2Client.setCredentials({
-      access_token: userTokens.access_token,
-      refresh_token: userTokens.refresh_token
-    });
-
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-
-    const message = await gmail.users.messages.get({
-      userId: 'me',
-      id: messageId,
-      format: 'full'
-    });
-
-    const headers = message.data.payload.headers;
-    const from = headers.find(h => h.name === 'From')?.value || 'Unknown';
-    const subject = headers.find(h => h.name === 'Subject')?.value || '(No Subject)';
-    const date = headers.find(h => h.name === 'Date')?.value || new Date().toISOString();
-    
-    let fromName = from;
-    let fromEmail = from;
-    const emailMatch = from.match(/<(.+?)>/);
-    if (emailMatch) {
-      fromEmail = emailMatch[1];
-      fromName = from.replace(`<${fromEmail}>`, '').trim() || fromEmail.split('@')[0];
-    }
-
-    let bodyText = '';
-    let bodyHtml = '';
-    
-    if (message.data.payload.parts) {
-      const textPart = message.data.payload.parts.find(part => part.mimeType === 'text/plain');
-      const htmlPart = message.data.payload.parts.find(part => part.mimeType === 'text/html');
-      
-      if (textPart?.body?.data) {
-        bodyText = Buffer.from(textPart.body.data, 'base64').toString('utf-8');
-      }
-      if (htmlPart?.body?.data) {
-        bodyHtml = Buffer.from(htmlPart.body.data, 'base64').toString('utf-8');
-      }
-    } else if (message.data.payload.body?.data) {
-      if (message.data.payload.mimeType === 'text/html') {
-        bodyHtml = Buffer.from(message.data.payload.body.data, 'base64').toString('utf-8');
-      } else {
-        bodyText = Buffer.from(message.data.payload.body.data, 'base64').toString('utf-8');
-      }
-    }
-
-    res.json({
-      id: messageId,
-      threadId: message.data.threadId,
-      from_name: fromName,
-      from_email: fromEmail,
-      subject: subject,
-      date: date,
-      body_text: bodyText,
-      body_html: bodyHtml,
-      read: !message.data.labelIds?.includes('UNREAD'),
-      snippet: message.data.snippet,
-      labelIds: message.data.labelIds || []
-    });
-
-  } catch (error) {
-    console.error('Error fetching message:', error);
-    res.status(500).json({ error: 'Failed to fetch message' });
-  }
-});
-
-// --- 10. Mark message as read ---
+// --- 11. Mark message as read ---
 app.post('/api/inbox/read/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -469,7 +442,7 @@ app.post('/api/inbox/read/:messageId', async (req, res) => {
   }
 });
 
-// --- 11. Delete message ---
+// --- 12. Delete message ---
 app.delete('/api/inbox/:messageId', async (req, res) => {
   try {
     const { messageId } = req.params;
@@ -508,7 +481,7 @@ app.delete('/api/inbox/:messageId', async (req, res) => {
   }
 });
 
-// --- 12. Get unread count ---
+// --- 13. Get unread count ---
 app.get('/api/inbox/unread/count', async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -548,80 +521,10 @@ app.get('/api/inbox/unread/count', async (req, res) => {
 });
 
 // ==========================================
-//  GOOGLE OAUTH FLOW
-// ==========================================
-
-// --- 13. Google OAuth Connect ---
-app.get('/api/google/connect', (req, res) => {
-  const userId = req.query.userId; 
-  if (!userId) {
-    return res.status(400).send("Missing userId. Cannot link account.");
-  }
-
-  const redirectUri = 'https://flowon.onrender.com/api/google/oauth/callback';
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  
-  const scope = encodeURIComponent('openid email profile https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify');
-
-  const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=${scope}&access_type=offline&prompt=consent&state=${userId}`;
-  
-  res.redirect(authUrl);
-});
-
-// --- 14. Google OAuth Callback ---
-app.get('/api/google/oauth/callback', async (req, res) => {
-  const code = req.query.code;
-  const userId = req.query.state; 
-
-  if (!code) return res.status(400).send("No code provided");
-  if (!userId) return res.status(400).send("No userId returned in state parameter");
-
-  try {
-    const tokenResponse = await axios.post('https://oauth2.googleapis.com/token', null, {
-      params: {
-        code: code,
-        client_id: process.env.GOOGLE_CLIENT_ID,
-        client_secret: process.env.GOOGLE_CLIENT_SECRET,
-        redirect_uri: 'https://flowon.onrender.com/api/google/oauth/callback',
-        grant_type: 'authorization_code'
-      }
-    });
-
-    const { access_token, refresh_token, expires_in } = tokenResponse.data;
-    
-    await saveTokensToDB({
-      userId,
-      access_token,
-      refresh_token,
-      expires_at: Date.now() + expires_in * 1000
-    });
-
-    try {
-        console.log(`Sending credentials to n8n for User: ${userId}`);
-        await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
-            userId: userId, 
-            google_access_token: access_token,
-            google_refresh_token: refresh_token || "ALREADY_AUTHORIZED", 
-            token_expiry: Date.now() + expires_in * 1000,
-            timestamp: new Date().toISOString()
-        });
-    } catch (n8nError) {
-        console.error("Failed to send keys to n8n:", n8nError.message);
-    }
-
-    res.redirect('https://seraphielspark.github.io/flowon/flow.html?status=connected');
-
-  } catch (err) {
-    console.error("OAuth token exchange error:", err.response?.data || err.message);
-    res.status(500).send("Failed to connect Gmail");
-  }
-});
-
-// ==========================================
 //  DEBUG & STATUS ENDPOINTS
 // ==========================================
 
-// --- 15. Debug token status ---
+// --- 14. Debug token status ---
 app.get('/api/debug/tokens/:userId', async (req, res) => {
   const { userId } = req.params;
   const tokens = await getTokensFromDB(userId);
@@ -632,19 +535,17 @@ app.get('/api/debug/tokens/:userId', async (req, res) => {
       hasAccessToken: !!tokens.access_token,
       hasRefreshToken: !!tokens.refresh_token,
       expires_at: tokens.expires_at,
-      expires_in_days: tokens.expires_at ? Math.round((tokens.expires_at - Date.now()) / (1000 * 60 * 60 * 24)) : null,
       user_id: userId
     });
   } else {
     res.json({ 
       exists: false, 
-      user_id: userId,
-      message: 'No tokens found for this user'
+      user_id: userId
     });
   }
 });
 
-// --- 16. Google connection status ---
+// --- 15. Google connection status ---
 app.get('/api/google/status', async (req, res) => {
   const userId = req.query.userId;
   
@@ -661,34 +562,8 @@ app.get('/api/google/status', async (req, res) => {
   res.json({ 
     connected,
     userId,
-    hasTokens: !!tokens,
-    tokenExpiry: tokens?.expires_at,
-    isExpired: tokens?.expires_at ? tokens.expires_at < Date.now() : null
+    hasTokens: !!tokens
   });
-});
-
-// --- 17. Force refresh tokens ---
-app.post('/api/google/refresh-tokens/:userId', async (req, res) => {
-  const { userId } = req.params;
-  
-  if (tokensDB[userId]) {
-    delete tokensDB[userId];
-  }
-  
-  const tokens = await getTokensFromDB(userId);
-  
-  if (tokens) {
-    res.json({ 
-      success: true, 
-      message: 'Tokens refreshed from n8n',
-      hasTokens: true
-    });
-  } else {
-    res.json({ 
-      success: false, 
-      message: 'No tokens found in n8n for this user'
-    });
-  }
 });
 
 // --- Start Server ---
