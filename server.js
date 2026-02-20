@@ -1026,6 +1026,35 @@ app.post('/api/debug/clear-message-history', authenticate, (req, res) => {
         res.json({ success: false, message: `No history found for user ${userId}` });
     }
 });
-
+// Create session after n8n authentication
+app.post('/api/create-session', async (req, res) => {
+  try {
+    const { userId, email } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+    
+    // Set session
+    req.session.userId = userId;
+    req.session.userEmail = email;
+    req.session.loginTime = Date.now();
+    req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+    
+    // Set CSRF cookie
+    res.cookie('XSRF-TOKEN', req.session.csrfToken, {
+      httpOnly: false,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Session creation error:', error);
+    res.status(500).json({ error: 'Failed to create session' });
+  }
+});
 // --- Start Server ---
 app.listen(PORT, () => console.log(`Secure server running on port ${PORT}`));
+
