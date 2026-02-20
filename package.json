@@ -1,6 +1,6 @@
 {
   "name": "flowon-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -13,7 +13,11 @@
     "cors": "^2.8.5",
     "express-session": "^1.17.3",
     "dotenv": "^16.3.1",
-    "googleapis": "^129.0.0"
+    "googleapis": "^129.0.0",
+    "cookie-parser": "^1.4.6",
+    "csurf": "^1.11.0",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
