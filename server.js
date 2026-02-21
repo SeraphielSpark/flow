@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ==========================================
-//  SECURITY MIDDLEWARE (ADDED)
+//  SECURITY MIDDLEWARE
 // ==========================================
 
 // Helmet for security headers
@@ -65,20 +65,36 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Session setup (HTTP-only cookies)
+// ==========================================
+//  SESSION CONFIGURATION - FIXED
+// ==========================================
+
+// Memory store for sessions (use Redis in production)
+const sessionStore = new session.MemoryStore();
+
+// Session setup (HTTP-only cookies) - IMPROVED CONFIGURATION
 app.use(session({
     name: 'fluxon.sid',
     secret: process.env.SESSION_SECRET || 'super-secret-key-change-this',
-    resave: false,
-    saveUninitialized: false,
+    store: sessionStore,
+    resave: true, // Changed to true to ensure session is saved
+    saveUninitialized: true, // Changed to true to create session even if not modified
     cookie: {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
         path: '/'
-    }
+    },
+    rolling: true // Refresh session with each request
 }));
+
+// Debug middleware to log session creation
+app.use((req, res, next) => {
+    console.log('Session ID:', req.sessionID);
+    console.log('Session user:', req.session.userId);
+    next();
+});
 
 // CSRF protection (exclude certain paths)
 const csrfProtection = csrf({
@@ -98,7 +114,6 @@ const limiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => {
-        // Skip rate limiting for specific paths if needed
         return req.path === '/get';
     }
 });
@@ -107,25 +122,25 @@ const limiter = rateLimit({
 app.use('/api/', limiter);
 
 // ==========================================
-//  AUTHENTICATION MIDDLEWARE (ADDED)
+//  AUTHENTICATION MIDDLEWARE
 // ==========================================
 
 // Authentication middleware
 const authenticate = (req, res, next) => {
+    console.log('Authenticate check - Session userId:', req.session.userId);
     if (!req.session.userId) {
         return res.status(401).json({ error: 'Authentication required' });
     }
     next();
 };
 
-// Optional authentication (doesn't block, but adds user info if available)
+// Optional authentication
 const optionalAuth = (req, res, next) => {
-    // Just continue, userId will be undefined if not logged in
     next();
 };
 
 // ==========================================
-//  HELPER FUNCTIONS (Token Management)
+//  HELPER FUNCTIONS
 // ==========================================
 
 let tokensDB = {};
@@ -134,8 +149,8 @@ let lastMessageCheck = {};
 
 // Rate limiting for token operations
 const tokenRateLimiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 30, // 30 requests per minute
+    windowMs: 60 * 1000,
+    max: 30,
     keyGenerator: (req) => req.session.userId || req.ip
 });
 
@@ -268,7 +283,7 @@ async function sendWhatsAppNotification(userId, messageDetails) {
 }
 
 // ==========================================
-//  LOGIN/LOGOUT ENDPOINTS (ADDED)
+//  LOGIN/LOGOUT ENDPOINTS
 // ==========================================
 
 // Login endpoint
@@ -280,13 +295,11 @@ app.post('/api/login', limiter, async (req, res) => {
             return res.status(400).json({ error: 'Email and password required' });
         }
         
-        // Basic email validation
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) {
             return res.status(400).json({ error: 'Invalid email format' });
         }
         
-        // Call n8n to authenticate
         const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -309,18 +322,29 @@ app.post('/api/login', limiter, async (req, res) => {
         req.session.loginTime = Date.now();
         req.session.csrfToken = crypto.randomBytes(32).toString('hex');
         
-        // Set CSRF cookie
-        res.cookie('XSRF-TOKEN', req.session.csrfToken, {
-            httpOnly: false, // Must be accessible to JavaScript
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'lax',
-            maxAge: 24 * 60 * 60 * 1000 // 24 hours
-        });
-        
-        res.json({ 
-            success: true, 
-            userId: data.userId,
-            email: email
+        // Save session explicitly
+        req.session.save((err) => {
+            if (err) {
+                console.error('Session save error:', err);
+                return res.status(500).json({ error: 'Failed to save session' });
+            }
+            
+            console.log('Session saved for user:', data.userId);
+            console.log('Session ID:', req.sessionID);
+            
+            // Set CSRF cookie
+            res.cookie('XSRF-TOKEN', req.session.csrfToken, {
+                httpOnly: false,
+                secure: process.env.NODE_ENV === 'production',
+                sameSite: 'lax',
+                maxAge: 24 * 60 * 60 * 1000
+            });
+            
+            res.json({ 
+                success: true, 
+                userId: data.userId,
+                email: email
+            });
         });
         
     } catch (error) {
@@ -342,13 +366,17 @@ app.post('/api/logout', authenticate, (req, res) => {
     });
 });
 
-// Session check endpoint
+// Session check endpoint - IMPROVED LOGGING
 app.get('/api/session', (req, res) => {
+    console.log('Session check - Session ID:', req.sessionID);
+    console.log('Session check - UserId:', req.session.userId);
+    
     if (req.session.userId) {
         res.json({
             authenticated: true,
             userId: req.session.userId,
-            userEmail: req.session.userEmail
+            userEmail: req.session.userEmail,
+            sessionId: req.sessionID
         });
     } else {
         res.json({ authenticated: false });
@@ -357,7 +385,6 @@ app.get('/api/session', (req, res) => {
 
 // CSRF token endpoint
 app.get('/api/csrf-token', authenticate, (req, res) => {
-    // Generate new CSRF token if needed
     if (!req.session.csrfToken) {
         req.session.csrfToken = crypto.randomBytes(32).toString('hex');
         res.cookie('XSRF-TOKEN', req.session.csrfToken, {
@@ -372,14 +399,68 @@ app.get('/api/csrf-token', authenticate, (req, res) => {
 });
 
 // ==========================================
-//  CSRF EXEMPTED ROUTES (GET requests don't need CSRF)
+//  CREATE SESSION ENDPOINT - FIXED
+// ==========================================
+
+app.post('/api/create-session', async (req, res) => {
+  try {
+    const { userId, email } = req.body;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+    
+    console.log('Creating session for user:', userId);
+    
+    // Regenerate session to ensure clean state
+    req.session.regenerate((err) => {
+        if (err) {
+            console.error('Session regeneration error:', err);
+            return res.status(500).json({ error: 'Failed to create session' });
+        }
+        
+        // Set session data
+        req.session.userId = userId;
+        req.session.userEmail = email || 'user@example.com';
+        req.session.loginTime = Date.now();
+        req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+        
+        // Save session
+        req.session.save((saveErr) => {
+            if (saveErr) {
+                console.error('Session save error:', saveErr);
+                return res.status(500).json({ error: 'Failed to save session' });
+            }
+            
+            console.log('Session created successfully for user:', userId);
+            console.log('Session ID:', req.sessionID);
+            
+            // Set CSRF cookie
+            res.cookie('XSRF-TOKEN', req.session.csrfToken, {
+                httpOnly: false,
+                secure: process.env.NODE_ENV === 'production',
+                sameSite: 'lax',
+                maxAge: 24 * 60 * 60 * 1000
+            });
+            
+            res.json({ success: true, userId });
+        });
+    });
+    
+  } catch (error) {
+    console.error('Session creation error:', error);
+    res.status(500).json({ error: 'Failed to create session' });
+  }
+});
+
+// ==========================================
+//  CSRF EXEMPTED ROUTES
 // ==========================================
 
 // --- 1. Proxy GET User Data ---
 app.get('/api/userdata/:flowid', authenticate, async (req, res) => {
     const { flowid } = req.params;
     
-    // Verify user owns this data
     if (req.session.userId !== flowid) {
         return res.status(403).json({ error: 'Access denied' });
     }
@@ -403,7 +484,7 @@ app.get('/api/userdata/:flowid', authenticate, async (req, res) => {
     }
 });
 
-// --- 6. Simple GET endpoint (no auth required) ---
+// --- 6. Simple GET endpoint ---
 app.get('/get', (req, res) => {
     res.json({ 
         status: 'online',
@@ -416,7 +497,6 @@ app.get('/get', (req, res) => {
 app.get('/api/whatsapp/status', authenticate, async (req, res) => {
     try {
         const userId = req.session.userId;
-        
         const whatsapp = await getWhatsAppNumber(userId);
         
         if (whatsapp) {
@@ -537,7 +617,6 @@ app.get('/api/inbox', authenticate, async (req, res) => {
         const validMessages = inboxMessages.filter(msg => msg !== null);
         validMessages.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-        // AUTO WHATSAPP NOTIFICATION FOR NEW MESSAGES
         const whatsapp = await getWhatsAppNumber(userId);
         if (whatsapp) {
             const unreadMessages = validMessages.filter(msg => !msg.read);
@@ -614,7 +693,7 @@ app.get('/api/inbox/unread/count', authenticate, async (req, res) => {
     }
 });
 
-// --- 18. Debug token status (protected) ---
+// --- 18. Debug token status ---
 app.get('/api/debug/tokens/:userId', authenticate, async (req, res) => {
     const { userId } = req.params;
     
@@ -643,7 +722,6 @@ app.get('/api/debug/tokens/:userId', authenticate, async (req, res) => {
 // --- 19. Google connection status ---
 app.get('/api/google/status', authenticate, async (req, res) => {
     const userId = req.session.userId;
-    
     const tokens = await getTokensFromDB(userId);
     const connected = !!(tokens && tokens.access_token);
     
@@ -655,7 +733,7 @@ app.get('/api/google/status', authenticate, async (req, res) => {
 });
 
 // ==========================================
-//  CSRF PROTECTED ROUTES (POST, PUT, DELETE)
+//  CSRF PROTECTED ROUTES
 // ==========================================
 app.use('/api/', csrfProtection);
 
@@ -735,7 +813,6 @@ app.post('/api/send-automated-messages', authenticate, async (req, res) => {
         const userTokens = await getTokensFromDB(userId);
         
         if (!userTokens) {
-            console.warn(`Attempt to send email failed: No tokens found for user ${userId}`);
             return res.status(400).json({ error: 'User Gmail not connected or tokens expired. Please reconnect.' });
         }
 
@@ -779,7 +856,7 @@ app.post('/api/send-automated-messages', authenticate, async (req, res) => {
     }
 });
 
-// --- 7. Receive email webhook (public, no CSRF) ---
+// --- 7. Receive email webhook ---
 app.post('/api/receive-email', (req, res) => {
     const emailData = req.body;
     console.log('Email received webhook:', emailData);
@@ -1026,35 +1103,9 @@ app.post('/api/debug/clear-message-history', authenticate, (req, res) => {
         res.json({ success: false, message: `No history found for user ${userId}` });
     }
 });
-// Create session after n8n authentication
-app.post('/api/create-session', async (req, res) => {
-  try {
-    const { userId, email } = req.body;
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID required' });
-    }
-    
-    // Set session
-    req.session.userId = userId;
-    req.session.userEmail = email;
-    req.session.loginTime = Date.now();
-    req.session.csrfToken = crypto.randomBytes(32).toString('hex');
-    
-    // Set CSRF cookie
-    res.cookie('XSRF-TOKEN', req.session.csrfToken, {
-      httpOnly: false,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000
-    });
-    
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Session creation error:', error);
-    res.status(500).json({ error: 'Failed to create session' });
-  }
-});
-// --- Start Server ---
-app.listen(PORT, () => console.log(`Secure server running on port ${PORT}`));
 
+// --- Start Server ---
+app.listen(PORT, () => {
+    console.log(`Secure server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
