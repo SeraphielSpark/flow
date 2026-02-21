@@ -12,7 +12,17 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Render.com does NOT set NODE_ENV=production automatically.
+// We detect production by checking if we're NOT on localhost.
+// This ensures cross-origin cookies (sameSite:'none' + secure:true) work correctly
+// between seraphielspark.github.io (frontend) and flowon.onrender.com (backend).
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' ||
+    (process.env.RENDER === 'true') ||
+    (!!(process.env.RENDER_SERVICE_NAME)) ||
+    (process.env.PORT && process.env.PORT !== '3000' && !process.env.LOCAL_DEV);
+
+console.log(`[Config] IS_PRODUCTION: ${IS_PRODUCTION}, NODE_ENV: ${process.env.NODE_ENV}, RENDER: ${process.env.RENDER}`);
 
 // ==========================================
 //  IN-MEMORY STORES (swap to Redis/DB later)
@@ -126,6 +136,14 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 //  SESSION
 // ==========================================
 
+// Trust the first proxy (Render sits behind a proxy/load balancer).
+// MUST be set before session middleware.
+// Without this, express-session won't set secure cookies because
+// req.secure is false (TLS is terminated at the proxy level).
+if (IS_PRODUCTION) {
+    app.set('trust proxy', 1);
+}
+
 app.use(session({
     name: 'fluxon.sid',
     secret: process.env.SESSION_SECRET || 'super-secret-key-CHANGE-THIS-IN-PRODUCTION',
@@ -133,6 +151,11 @@ app.use(session({
     saveUninitialized: false,
     cookie: {
         httpOnly: true,
+        // CRITICAL: Cross-origin cookies (GitHub Pages → Render) require BOTH:
+        //   secure: true  (HTTPS only)
+        //   sameSite: 'none'  (allow cross-origin sending)
+        // Without these, the browser drops the cookie and /api/session always
+        // returns { authenticated: false } even after successful login.
         secure: IS_PRODUCTION,
         sameSite: IS_PRODUCTION ? 'none' : 'lax',
         maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -502,6 +525,7 @@ app.get('/api/session', (req, res) => {
 });
 
 // CSRF token — for SPAs that need to fetch it after page load
+// Requires authentication (session must exist)
 app.get('/api/csrf-token', authenticate, (req, res) => {
     // Ensure CSRF token exists
     if (!req.session.csrfToken) {
@@ -510,6 +534,56 @@ app.get('/api/csrf-token', authenticate, (req, res) => {
     }
     setCsrfCookie(res, req.session.csrfToken);
     res.json({ csrfToken: req.session.csrfToken });
+});
+
+// CSRF bootstrap — creates a guest session with CSRF token.
+// Used when localStorage has a userId (from signup) but no session cookie exists yet.
+// This allows the frontend to re-establish a proper session without re-logging in.
+app.post('/api/csrf-bootstrap', async (req, res) => {
+    try {
+        const { userId, email } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'userId required' });
+        }
+
+        // If session already exists for this user, just return the existing CSRF token
+        if (req.session && req.session.userId === userId) {
+            if (!req.session.csrfToken) {
+                req.session.csrfToken = generateCsrfToken();
+                await new Promise(resolve => req.session.save(resolve));
+            }
+            setCsrfCookie(res, req.session.csrfToken);
+            return res.json({ csrfToken: req.session.csrfToken, reused: true });
+        }
+
+        // Create a new session for this userId
+        req.session.regenerate((err) => {
+            if (err) {
+                return res.status(500).json({ error: 'Session creation failed' });
+            }
+
+            const csrfToken = generateCsrfToken();
+            req.session.userId = userId;
+            req.session.userEmail = email || '';
+            req.session.loginTime = Date.now();
+            req.session.csrfToken = csrfToken;
+
+            req.session.save((saveErr) => {
+                if (saveErr) {
+                    return res.status(500).json({ error: 'Session save failed' });
+                }
+
+                setCsrfCookie(res, csrfToken);
+                console.log(`[CSRF Bootstrap] ✓ Session restored for user: ${userId}`);
+                res.json({ csrfToken, restored: true });
+            });
+        });
+
+    } catch (error) {
+        logError('CSRF Bootstrap', error);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // Create session (used when OAuth flow or external auth sets userId)
