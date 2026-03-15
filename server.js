@@ -86,7 +86,7 @@ app.use(helmet({
             fontSrc: ["'self'", "https://fonts.gstatic.com"],
             scriptSrc: ["'self'", "https://cdnjs.cloudflare.com", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:", "https:", "https://seraphielspark.github.io"],
-            connectSrc: ["'self'", "https://kingoftech.app.n8n.cloud", "https://flowon.onrender.com"],
+            connectSrc: ["'self'", "https://southlord.app.n8n.cloud", "https://flowon.onrender.com"],
             frameSrc: ["'none'"],
             objectSrc: ["'none'"]
         }
@@ -245,7 +245,7 @@ async function getTokensFromDB(userId) {
     console.log(`[Tokens] Cache miss for ${userId}, fetching from cloud...`);
     try {
         const response = await fetch(
-            `https://kingoftech.app.n8n.cloud/webhook/get-user-tokens?userId=${encodeURIComponent(userId)}`,
+            `https://southlord.app.n8n.cloud/webhook/get-user-tokens?userId=${encodeURIComponent(userId)}`,
             { timeout: 8000 }
         );
 
@@ -305,7 +305,7 @@ async function getOAuth2Client(userId) {
 
         // Persist refreshed tokens to n8n cloud
         try {
-            await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
+            await axios.post('https://southlord.app.n8n.cloud/webhook/link', {
                 userId,
                 google_access_token: tokens.access_token || updated.access_token,
                 google_refresh_token: tokens.refresh_token || updated.refresh_token,
@@ -336,7 +336,7 @@ async function saveWhatsAppNumber(userId, phoneNumber) {
     console.log(`[WhatsApp] Number saved for user: ${userId}`);
 
     try {
-        await axios.post('https://kingoftech.app.n8n.cloud/webhook/whatsapp-register', {
+        await axios.post('https://southlord.app.n8n.cloud/webhook/whatsapp-register', {
             userId,
             phoneNumber,
             timestamp: new Date().toISOString()
@@ -366,7 +366,7 @@ async function sendWhatsAppNotification(userId, { from, subject, snippet, messag
 
         const message = `📧 *New Message Received*\n\n*From:* ${from}\n*Subject:* ${subject}\n\n*Preview:* ${snippet || 'No preview available'}\n\nCheck your inbox for more details.`;
 
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/receive', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/receive', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -447,7 +447,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
             return res.status(400).json({ error: 'Invalid email format' });
         }
 
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/login', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email, password })
@@ -696,7 +696,7 @@ app.get('/api/google/oauth/callback', async (req, res) => {
 
         // Send tokens to n8n for persistence (non-fatal if it fails)
         try {
-            await axios.post('https://kingoftech.app.n8n.cloud/webhook/link', {
+            await axios.post('https://southlord.app.n8n.cloud/webhook/link', {
                 userId,
                 google_access_token: access_token,
                 google_refresh_token: refresh_token || 'ALREADY_AUTHORIZED',
@@ -741,7 +741,7 @@ app.get('/api/userdata/:flowid', authenticate, async (req, res) => {
 
     try {
         const response = await fetch(
-            `https://kingoftech.app.n8n.cloud/webhook/e6bf03cc-c9e6-4727-91c5-375b420ac2ce/${flowid}/`
+            `https://southlord.app.n8n.cloud/webhook/e6bf03cc-c9e6-4727-91c5-375b420ac2ce/${flowid}/`
         );
 
         if (!response.ok) {
@@ -966,7 +966,7 @@ app.post('/api/updatecustomers', authenticate, csrfProtect, async (req, res) => 
     const userId = req.session.userId;
 
     try {
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/updatecustomers', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/updatecustomers', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -993,7 +993,7 @@ app.post('/api/createtable', authenticate, csrfProtect, async (req, res) => {
     }
 
     try {
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/createtable', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/createtable', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ userid: userId, name: name.trim() })
@@ -1012,7 +1012,7 @@ app.post('/api/updatetemplates', authenticate, csrfProtect, async (req, res) => 
     const userId = req.session.userId;
 
     try {
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/updatetemplates', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/updatetemplates', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ userid: userId, templates })
@@ -1059,7 +1059,7 @@ app.post('/api/send-automated-messages', authenticate, csrfProtect, async (req, 
 
         console.log(`[Campaign] Sending for user ${userId} to ${payload.recipients.length} recipients`);
 
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/send-automated-messages', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/send-automated-messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -1128,7 +1128,7 @@ app.post('/api/whatsapp/notify', authenticate, csrfProtect, async (req, res) => 
             return res.status(400).json({ error: 'No WhatsApp number registered for this user' });
         }
 
-        const response = await fetch('https://kingoftech.app.n8n.cloud/webhook/receive', {
+        const response = await fetch('https://southlord.app.n8n.cloud/webhook/receive', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
